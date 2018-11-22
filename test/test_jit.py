@@ -8522,6 +8522,14 @@ a")
             return a
         self.checkScript(foo, (torch.rand(2, 3), torch.rand(3)))
 
+    def test_lhs_advanced_indexing(self):
+        def foo(x, y):
+            a = torch.exp(x)
+            b = x == 1
+            a[b] = y[b]
+            return a
+        self.checkScript(foo, (torch.ones(4, 3), torch.ones(4, 3)))
+
     def test_lhs_indexing_list(self):
         def foo(a, b):
             ls = [a]

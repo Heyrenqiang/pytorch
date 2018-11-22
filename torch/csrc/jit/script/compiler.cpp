@@ -1617,20 +1617,47 @@ private:
 
     // If it's a tensor, copy the RHS data into it
     if (sliceable->type()->isSubtypeOf(DynamicType::get())) {
+      std::vector<Value*> tensorIndices;
+      Value* sliced;
+      // Handle multi-dimensional slicing: first emit int/slice indexing
+      // TODO: the Python equivalent code has special-cased copy_to
+      // broadcasting to match NumPy semantics (see PR#4853). We can't
+      // replicate that without knowing the size of the Tensor; so really that
+      // code should be moved into the aten function
+      std::tie(sliced, tensorIndices) = emitIntAndSliceIndexing(
+          lhs.range(), sliceable, lhs.subscript_exprs());
+
       std::vector<NamedValue> args;
-      // Obtain the sliced value
-      auto lhsValue =
-          emitSubscript(lhs.range(), sliceable, lhs.subscript_exprs());
-      args.emplace_back(lhs.range(), "t", lhsValue);
-      args.emplace_back(rhs.loc(), "other", rhs.value(*graph));
-      emitBuiltinCall(
-          stmtRange,
-          *method.graph(),
-          aten::copy_,
-          c10::nullopt,
-          args,
-          {},
-          true);
+      if (tensorIndices.size() == 0) {
+        // Common case: we only tried to index with int and slices. Copy the
+        // RHS into the resulting tensor.
+        args.emplace_back(lhs.range(), "t", sliced);
+        args.emplace_back(rhs.loc(), "other", rhs.value(*graph));
+        emitBuiltinCall(
+            stmtRange,
+            *method.graph(),
+            aten::copy_,
+            c10::nullopt,
+            args,
+            {},
+            true);
+      } else {
+        // Special case: we tried to do "advanced indexing" with a tensor.
+        // Dispatch to `aten::index_put_`.
+        args.emplace_back(lhs.range(), "t", sliced);
+        auto index = graph->insertNode(
+          graph->createList(DynamicType::get(), tensorIndices))->output();
+        args.emplace_back(lhs.range(), "indices", index);
+        args.emplace_back(rhs.loc(), "other", rhs.value(*graph));
+        emitBuiltinCall(
+            stmtRange,
+            *method.graph(),
+            aten::index_put_,
+            c10::nullopt,
+            args,
+            {},
+            true);
+      }
 
     // Otherwise, this is a list. Dispatch to aten::_set_item to both select and
     // assign
@@ -2197,6 +2224,13 @@ private:
         << "Unsupported operation: indexing tensor with unsupported index type "
         << index->type()->str() << ". Only ints, slices, and tensors are supported.";
     }
+    // at::index takes in a TensorList where some tensors can be undefined.
+    // Convert NULL tensorIndices to undefined tensors to pass to at::index.
+    for (auto& index : tensor_indices) {
+      if (index == nullptr) {
+        index = graph->insertNode(graph->createUndefined())->output();
+      }
+    }
     return std::make_pair(sliceable, tensor_indices);
   }
 
@@ -2237,13 +2271,6 @@ private:
       return sliceable;
     }
 
-    // at::index takes in a TensorList where some tensors can be undefined.
-    // Convert NULL tensor_indices to undefined tensors to pass to at::index.
-    for (auto& index : tensor_indices) {
-      if (index == nullptr) {
-        index = graph->insertNode(graph->createUndefined())->output();
-      }
-    }
     return emitIndex(loc, sliceable, tensor_indices);
   }
 
